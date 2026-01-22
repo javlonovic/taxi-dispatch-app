@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Notification icon color - uses app primary color -->
+    <!-- This color will be applied to the notification icon in the status bar -->
+    <!-- Adjust this to match your app's brand color -->
+    <color name="notification_color">#FFA000</color>
+</resources>

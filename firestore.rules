@@ -1,0 +1,388 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    
+    function isDriver() {
+      return isAuthenticated() && getUserData().type == 'driver';
+    }
+    
+    function isCompany() {
+      return isAuthenticated() && getUserData().type == 'company';
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && getUserData().isAdmin == true;
+    }
+    
+    function isDriverVerified() {
+      return isDriver() && getUserData().verificationStatus == 'approved';
+    }
+    
+    // Users collection rules
+    match /users/{userId} {
+      // Allow read if:
+      // - Authenticated users with proper permissions
+      // - Unauthenticated users for username validation
+      allow read: if true;
+      
+      // Allow create during registration
+      // Note: For registration, we need to allow creation even before full authentication
+      allow create: if (request.auth != null && request.auth.uid == userId) || 
+                       (request.auth == null && isValidRegistrationData());
+      
+      // Allow update only if:
+      // - Owner updating their own profile (with restrictions)
+      // - Admin updating any profile
+      allow update: if isAuthenticated() && (
+        (isOwner(userId) && isValidUserUpdate()) ||
+        (isAdmin() && isValidAdminUpdate())
+      );
+      
+      // Only admin can delete users
+      allow delete: if isAdmin();
+      
+      // Validate registration data for unauthenticated users
+      function isValidRegistrationData() {
+        let data = request.resource.data;
+        return data.keys().hasAll(['email', 'fullName', 'type']) &&
+               data.email is string &&
+               data.fullName is string &&
+               data.type in ['driver', 'company'];
+      }
+      
+      // Validate user updates
+      function isValidUserUpdate() {
+        let unchangedFields = ['id', 'type', 'email', 'createdAt'];
+        let protectedFields = ['verificationStatus', 'verificationNotes', 'isAdmin'];
+        
+        return !request.resource.data.diff(resource.data).affectedKeys().hasAny(unchangedFields) &&
+               !request.resource.data.diff(resource.data).affectedKeys().hasAny(protectedFields);
+      }
+      
+      // Admin can update verification status and other protected fields
+      function isValidAdminUpdate() {
+        return true;
+      }
+      
+      // Branch management subcollection rules
+      match /branches/{branchId} {
+        // Allow read if authenticated user is the owner or admin
+        allow read: if isAuthenticated() && (isOwner(userId) || isAdmin());
+        
+        // Allow create if:
+        // - Authenticated user is the owner
+        // - User is a company type
+        // - All required fields are present and valid
+        allow create: if isAuthenticated() && 
+          isOwner(userId) &&
+          get(/databases/$(database)/documents/users/$(userId)).data.type == 'company' &&
+          isValidBranchData();
+        
+        // Allow update if:
+        // - Authenticated user is the owner
+        // - Only allowed fields are modified
+        allow update: if isAuthenticated() && 
+          isOwner(userId) &&
+          isValidBranchUpdate();
+        
+        // Allow delete if authenticated user is the owner
+        // Note: Application logic prevents deletion of last branch
+        allow delete: if isAuthenticated() && isOwner(userId);
+        
+        // Validate branch data on creation
+        function isValidBranchData() {
+          let data = request.resource.data;
+          return data.keys().hasAll(['name', 'address', 'location', 'isHeadquarters', 'createdAt']) &&
+                 data.name is string &&
+                 data.name.size() > 0 &&
+                 data.name.size() <= 100 &&
+                 data.address is string &&
+                 data.address.size() > 0 &&
+                 data.address.size() <= 200 &&
+                 data.location is latlng &&
+                 data.isHeadquarters is bool;
+        }
+        
+        // Validate branch updates (only certain fields can be modified)
+        function isValidBranchUpdate() {
+          let allowedFields = ['name', 'address', 'location'];
+          let changedFields = request.resource.data.diff(resource.data).affectedKeys();
+          return changedFields.hasOnly(allowedFields) &&
+                 request.resource.data.name is string &&
+                 request.resource.data.name.size() > 0 &&
+                 request.resource.data.address is string &&
+                 request.resource.data.address.size() > 0 &&
+                 request.resource.data.location is latlng;
+        }
+      }
+    }
+    
+    // Rides collection rules
+    match /rides/{rideId} {
+      // Allow read if:
+      // - Company user who created the ride (even if driverUserId is null)
+      // - Driver assigned to the ride
+      // - Admin
+      allow read: if isAuthenticated() && (
+        (resource != null && resource.data.companyUserId == request.auth.uid) ||
+        (resource != null && resource.data.driverUserId != null && resource.data.driverUserId == request.auth.uid) ||
+        isAdmin()
+      );
+      
+      // Allow create if:
+      // - Company user creating their own ride
+      allow create: if isAuthenticated() && 
+        isCompany() && 
+        request.resource.data.companyUserId == request.auth.uid &&
+        request.resource.data.status == 'pending' &&
+        request.resource.data.driverUserId == null;
+      
+      // Allow update if:
+      // - Company user updating their own ride (limited fields)
+      // - Driver accepting or updating ride status
+      // - Admin
+      allow update: if isAuthenticated() && (
+        (isCompany() && resource.data.companyUserId == request.auth.uid && isValidCompanyRideUpdate()) ||
+        (isDriver() && isValidDriverRideUpdate()) ||
+        isAdmin()
+      );
+      
+      // Only admin can delete rides
+      allow delete: if isAdmin();
+      
+      // Company can only update certain fields
+      function isValidCompanyRideUpdate() {
+        let allowedFields = ['destination', 'destinationAddress', 'updatedAt'];
+        let changedFields = request.resource.data.diff(resource.data).affectedKeys();
+        
+        return changedFields.hasOnly(allowedFields) &&
+               resource.data.status == 'pending';
+      }
+      
+      // Driver can accept rides and update status
+      function isValidDriverRideUpdate() {
+        let changedFields = request.resource.data.diff(resource.data).affectedKeys();
+        
+        // Driver accepting a ride
+        let isAccepting = resource.data.status == 'pending' &&
+                         request.resource.data.status == 'accepted' &&
+                         request.resource.data.driverUserId == request.auth.uid &&
+                         isDriverVerified();
+        
+        // Driver updating ride status
+        let isUpdatingStatus = resource.data.driverUserId == request.auth.uid &&
+                              isValidStatusTransition() &&
+                              changedFields.hasOnly(['status', 'arrivedAt', 'completedAt', 'updatedAt']);
+        
+        return isAccepting || isUpdatingStatus;
+      }
+      
+      // Validate status transitions
+      function isValidStatusTransition() {
+        let currentStatus = resource.data.status;
+        let newStatus = request.resource.data.status;
+        
+        return (currentStatus == 'accepted' && newStatus == 'enroute') ||
+               (currentStatus == 'enroute' && newStatus == 'arrived') ||
+               (currentStatus == 'arrived' && newStatus == 'completed') ||
+               (currentStatus == 'pending' && newStatus == 'cancelled') ||
+               (currentStatus == 'accepted' && newStatus == 'cancelled');
+      }
+    }
+    
+    // Chats collection rules
+    match /chats/{rideId} {
+      // Allow read if user is part of the ride
+      allow read: if isAuthenticated() && isRideParticipant(rideId);
+      
+      // Allow create if ride exists and user is participant
+      allow create: if isAuthenticated() && isRideParticipant(rideId);
+      
+      // Messages subcollection
+      match /messages/{messageId} {
+        // Allow read if user is part of the ride
+        allow read: if isAuthenticated() && isRideParticipant(rideId);
+        
+        // Allow create if:
+        // - User is sender
+        // - User is part of the ride
+        allow create: if isAuthenticated() && 
+          isRideParticipant(rideId) &&
+          request.resource.data.senderId == request.auth.uid;
+        
+        // Allow update only to mark as read
+        allow update: if isAuthenticated() && 
+          isRideParticipant(rideId) &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+        
+        // No deletion of messages
+        allow delete: if false;
+      }
+      
+      function isRideParticipant(rideId) {
+        let ride = get(/databases/$(database)/documents/rides/$(rideId)).data;
+        return ride.companyUserId == request.auth.uid || 
+               ride.driverUserId == request.auth.uid;
+      }
+    }
+    
+    // Notifications collection rules (if stored in Firestore)
+    match /notifications/{notificationId} {
+      // Users can only read their own notifications
+      allow read: if isAuthenticated() && resource.data.userId == request.auth.uid;
+      
+      // System creates notifications (via Cloud Functions)
+      allow create: if false;
+      
+      // Users can update their own notifications (mark as read)
+      allow update: if isAuthenticated() && 
+        resource.data.userId == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'readAt']);
+      
+      // Users can delete their own notifications
+      allow delete: if isAuthenticated() && resource.data.userId == request.auth.uid;
+    }
+    
+    // Payments collection rules (if stored in Firestore)
+    match /payments/{paymentId} {
+      // Users can only read their own payment records
+      allow read: if isAuthenticated() && (
+        resource.data.companyUserId == request.auth.uid ||
+        resource.data.driverUserId == request.auth.uid ||
+        isAdmin()
+      );
+      
+      // System creates payments (via Cloud Functions or backend)
+      allow create: if false;
+      
+      // No updates or deletes
+      allow update: if false;
+      allow delete: if false;
+    }
+    
+    // Ratings collection (stored in ride documents)
+    // Ratings are part of the ride document, so they follow ride rules
+    
+    // Top-up records collection (admin balance management)
+    match /topUpRecords/{recordId} {
+      // Only admins can read top-up records
+      allow read: if isAdmin();
+      
+      // Only admins can create top-up records
+      allow create: if isAdmin() && isValidTopUpRecord();
+      
+      // No updates or deletes
+      allow update: if false;
+      allow delete: if false;
+      
+      function isValidTopUpRecord() {
+        let data = request.resource.data;
+        return data.keys().hasAll(['companyId', 'adminId', 'amount', 'timestamp']) &&
+               data.companyId is string &&
+               data.adminId is string &&
+               data.amount is number &&
+               data.amount >= 10000 &&
+               data.amount <= 10000000 &&
+               data.timestamp is timestamp;
+      }
+    }
+    
+    // Admin activity log
+    match /adminActivityLog/{logId} {
+      // Only admins can read activity logs
+      allow read: if isAdmin();
+      
+      // System creates activity logs
+      allow create: if isAdmin();
+      
+      // No updates or deletes
+      allow update: if false;
+      allow delete: if false;
+    }
+    
+    // Commission records collection
+    match /commissionRecords/{recordId} {
+      // Admins can read all records
+      // Companies can read their own records
+      // Drivers can read their own records
+      allow read: if isAuthenticated() && (
+        isAdmin() ||
+        resource.data.companyId == request.auth.uid ||
+        resource.data.driverId == request.auth.uid
+      );
+      
+      // System creates commission records
+      allow create: if false;
+      
+      // No updates or deletes
+      allow update: if false;
+      allow delete: if false;
+    }
+    
+    // Payment errors collection (for monitoring)
+    match /paymentErrors/{errorId} {
+      // Only admins can read payment errors
+      allow read: if isAdmin();
+      
+      // System creates error records
+      allow create: if false;
+      
+      // Admins can update to mark as resolved
+      allow update: if isAdmin() && 
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['resolved', 'resolvedAt', 'resolvedBy', 'resolutionNotes']);
+      
+      // No deletes
+      allow delete: if false;
+    }
+    
+    // User transactions subcollection
+    match /users/{userId}/transactions/{transactionId} {
+      // Users can read their own transactions
+      // Admins can read all transactions
+      allow read: if isAuthenticated() && (
+        isOwner(userId) ||
+        isAdmin()
+      );
+      
+      // System creates transactions
+      allow create: if false;
+      
+      // No updates or deletes
+      allow update: if false;
+      allow delete: if false;
+    }
+    
+    // Error logs collection (for monitoring)
+    match /errorLogs/{logId} {
+      // Only admins can read error logs
+      allow read: if isAdmin();
+      
+      // System creates error logs
+      allow create: if false;
+      
+      // No updates or deletes
+      allow update: if false;
+      allow delete: if false;
+    }
+    
+
+    
+    // Default deny all other collections
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -98,7 +98,7 @@ Proprietary - All rights reserved
 
 ## Support
 
-For support, contact: support@vezunchik.uz
+For support, contact: javlonovic@gmail.com
 
 ## Version
 
